@@ -470,6 +470,71 @@ func TestGetManifestObjectsPrecompiled(t *testing.T) {
 	assert.Equal(t, sanitizedKernel, daemonSet.Labels["nvidia.com/precompiled.kernel-version"])
 }
 
+// TestGetManifestObjectsReservedDriverLabelsIgnored is a regression test for
+// https://github.com/NVIDIA/gpu-operator/issues/3059: reserved keys in
+// NVIDIADriver spec.labels must not override the operator's own app and
+// app.kubernetes.io/component labels, which back the immutable DaemonSet
+// selector and the driver discovery used by auto-upgrade.
+func TestGetManifestObjectsReservedDriverLabelsIgnored(t *testing.T) {
+	testCases := map[string]struct {
+		labels map[string]string
+	}{
+		"app override": {
+			labels: map[string]string{
+				"app": "custom",
+			},
+		},
+		"component override": {
+			labels: map[string]string{
+				"app.kubernetes.io/component": "custom",
+			},
+		},
+		"reserved keys with custom label": {
+			labels: map[string]string{
+				"app":                         "custom",
+				"app.kubernetes.io/component": "custom",
+				"app.kubernetes.io/part-of":   "custom",
+				"my.custom/label":             "myvalue",
+			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			scheme := driverTestScheme(t)
+			driverState := newTestStateDriver(t, newDriverFakeClient(scheme, newGPUNode("gpu-node", "driver-a")), scheme)
+
+			driverCR := newDriverCR("driver-a")
+			driverCR.Spec.Labels = tc.labels
+
+			objects, err := driverState.getManifestObjects(context.Background(), driverCR, driverInfoCatalog(fakeClusterInfo{}))
+			require.NoError(t, err)
+
+			daemonSet, err := getDaemonsetFromObjects(objects)
+			require.NoError(t, err)
+
+			// The operator's app label must keep matching the immutable DaemonSet selector.
+			require.Equal(t, daemonSet.Spec.Selector.MatchLabels["app"], daemonSet.Labels["app"],
+				"DaemonSet app label must keep matching its immutable selector")
+			require.Equal(t, daemonSet.Spec.Selector.MatchLabels["app"], daemonSet.Spec.Template.Labels["app"],
+				"pod template app label must keep matching the immutable selector")
+			// The component label used for driver discovery and anti-affinity must survive.
+			assert.Equal(t, DriverAppComponentLabelValue, daemonSet.Labels[AppComponentLabelKey])
+			assert.Equal(t, DriverAppComponentLabelValue, daemonSet.Spec.Template.Labels[AppComponentLabelKey])
+			// Reserved keys are dropped so they cannot override the operator's
+			// labels; non-reserved custom labels must still be applied.
+			for key, value := range tc.labels {
+				if key == "app" || strings.HasPrefix(key, "app.kubernetes.io/") {
+					assert.NotEqual(t, value, daemonSet.Labels[key], "reserved label %q must not override the DaemonSet label", key)
+					assert.NotEqual(t, value, daemonSet.Spec.Template.Labels[key], "reserved label %q must not override the pod template label", key)
+					continue
+				}
+				assert.Equal(t, value, daemonSet.Labels[key], "custom label %q must be applied to the DaemonSet", key)
+				assert.Equal(t, value, daemonSet.Spec.Template.Labels[key], "custom label %q must be applied to the pod template", key)
+			}
+		})
+	}
+}
+
 func TestGetManifestObjectsOpenshiftDTK(t *testing.T) {
 	scheme := driverTestScheme(t)
 	const rhcosVersion = "413.92.202304252344-0"
